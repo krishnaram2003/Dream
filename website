@@ -1,0 +1,120 @@
+require("dotenv").config();
+const express = require("express");
+const mongoose = require("mongoose");
+const cors = require("cors");
+sanitize = require("mongo-sanitize");
+const { body, validationResult } = require("express-validator");
+
+const app = express();
+const PORT = process.env.PORT || 5000;
+const MAX_RETRIES = process.env.MAX_RETRIES ? parseInt(process.env.MAX_RETRIES, 10) : 5;
+let retryCount = 0;
+
+// Middleware
+app.use(cors());
+app.use(express.json());
+
+// MongoDB Connection with Exponential Backoff Retry Logic
+const connectWithRetry = () => {
+  if (retryCount >= MAX_RETRIES) {
+    console.error("Max retry attempts reached. Exiting process.");
+    process.exit(1);
+  }
+
+  mongoose.connect(process.env.MONGO_URI, {
+    useNewUrlParser: true,
+    useUnifiedTopology: true,
+  })
+  .then(() => {
+    console.log("MongoDB Connected");
+    retryCount = 0;
+  })
+  .catch(err => {
+    retryCount++;
+    const retryDelay = Math.min(5000 * Math.pow(2, retryCount - 1), 60000); // Exponential backoff, max 60s
+    console.error("Error connecting to MongoDB:", err);
+    console.log(`Retrying connection in ${retryDelay / 1000} seconds... (Attempt ${retryCount}/${MAX_RETRIES})`);
+    setTimeout(connectWithRetry, retryDelay);
+  });
+};
+
+connectWithRetry();
+
+// Contact Form Schema with Validation
+const contactSchema = new mongoose.Schema({
+  name: { type: String, required: true, trim: true },
+  email: { type: String, required: true, trim: true, match: /^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$/ },
+  phone: { type: String, required: false, trim: true, match: /^\+?[0-9]{7,15}$/ },
+  message: { type: String, required: true, trim: true, minlength: 10 },
+  date: { type: Date, default: Date.now }
+});
+
+const Contact = mongoose.model("Contact", contactSchema);
+
+// Routes
+app.get("/", (req, res) => {
+  res.send("Welcome to Civil Engineering Organization Backend");
+});
+
+// Handle Contact Form Submission with Validation and Sanitization
+app.post(
+  "/contact",
+  [
+    body("name").trim().notEmpty().withMessage("Name is required"),
+    body("email").isEmail().withMessage("Invalid email format"),
+    body("phone").optional().matches(/^\+?[0-9]{7,15}$/).withMessage("Invalid phone number format"),
+    body("message").trim().isLength({ min: 10 }).withMessage("Message must be at least 10 characters long"),
+  ],
+  async (req, res) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ success: false, errors: errors.array() });
+    }
+    
+    try {
+      const sanitizedData = {
+        name: sanitize(req.body.name) || "", // Ensuring sanitized fields are properly handled
+        email: sanitize(req.body.email) || "",
+        phone: sanitize(req.body.phone) || "",
+        message: sanitize(req.body.message) || ""
+      };
+      
+      if (!sanitizedData.name || !sanitizedData.email || !sanitizedData.message) {
+        return res.status(400).json({ success: false, message: "Invalid input detected" });
+      }
+      
+      const newContact = new Contact(sanitizedData);
+      await newContact.save();
+      res.status(201).json({ success: true, message: "Message sent successfully" });
+    } catch (error) {
+      console.error("Server error:", error);
+      res.status(500).json({ success: false, message: "An unexpected error occurred. Please try again later." });
+    }
+  }
+);
+
+// Start Server with Error Handling and Graceful Shutdown
+const server = app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
+});
+
+server.on("error", (err) => {
+  console.error("Server failed to start:", err);
+  process.exit(1);
+});
+
+// Graceful Shutdown Handling
+const gracefulShutdown = () => {
+  console.log("Received shutdown signal, closing server...");
+  server.close(() => {
+    console.log("Server closed");
+    mongoose.connection.close(false, () => {
+      console.log("MongoDB connection closed");
+      process.exit(0);
+    });
+  });
+};
+
+process.on("SIGINT", gracefulShutdown);
+process.on("SIGTERM", gracefulShutdown);
+process.on("SIGHUP", gracefulShutdown);
